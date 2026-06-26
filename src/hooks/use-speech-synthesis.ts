@@ -24,6 +24,8 @@ function pickBestVoice(voices: SpeechSynthesisVoice[]) {
 
 // Store utterance globally to prevent Android Chrome Garbage Collection bug
 // which stops speech midway and never fires onend
+// Store utterance globally to prevent Android Chrome Garbage Collection bug
+// which stops speech midway and never fires onend
 let globalUtterance: SpeechSynthesisUtterance | null = null;
 
 export function useSpeechSynthesis() {
@@ -40,9 +42,21 @@ export function useSpeechSynthesis() {
       return;
     }
 
-    const updateVoices = () => setVoices(window.speechSynthesis.getVoices());
+    let attempts = 0;
+    const updateVoices = () => {
+      const v = window.speechSynthesis.getVoices();
+      if (v.length > 0) {
+        setVoices(v);
+      } else if (attempts < 10) {
+        attempts++;
+        setTimeout(updateVoices, 250);
+      }
+    };
+
     updateVoices();
-    window.speechSynthesis.onvoiceschanged = updateVoices;
+    window.speechSynthesis.onvoiceschanged = () => {
+      setVoices(window.speechSynthesis.getVoices());
+    };
 
     return () => {
       window.speechSynthesis.onvoiceschanged = null;
@@ -67,12 +81,19 @@ export function useSpeechSynthesis() {
     if (selectedVoice) {
       utterance.voice = selectedVoice;
     }
-    utterance.lang = selectedVoice?.lang ?? 'hi-IN';
-    utterance.rate = 0.95;
-    utterance.pitch = 1;
+    // Android Chrome sometimes only recognizes "hi" instead of "hi-IN"
+    utterance.lang = selectedVoice?.lang ?? 'hi'; 
+    
+    // Simplest settings possible to avoid Android engine crash
     utterance.volume = 1;
+    
     utterance.onstart = () => setSpeaking(true);
-    utterance.onerror = () => {
+    utterance.onerror = (e) => {
+      console.error('SpeechSynthesisError:', e);
+      // Alert the user so they can debug the issue on their phone
+      if (e.error !== 'interrupted' && e.error !== 'canceled') {
+        alert('Voice Error: ' + e.error);
+      }
       setSpeaking(false);
       options.onEnd?.();
     };
@@ -89,7 +110,7 @@ export function useSpeechSynthesis() {
     // Another resume right after speak to force it on some broken Samsung browsers
     setTimeout(() => {
       window.speechSynthesis.resume();
-    }, 50);
+    }, 100);
   };
 
   const cancel = () => {
