@@ -7,17 +7,19 @@ interface SpeakOptions {
 }
 
 function pickBestVoice(voices: SpeechSynthesisVoice[]) {
-  const preferred = voices.find((voice) => /hi-IN/i.test(voice.lang) && /Google|Microsoft|Natural/i.test(voice.name));
-  if (preferred) {
-    return preferred;
+  // First try to find any Hindi voice
+  const hindi = voices.find((voice) => /hi-IN/i.test(voice.lang));
+  if (hindi) {
+    return hindi;
   }
 
+  // Fallback to Indian English
   const indianEnglish = voices.find((voice) => /en-IN/i.test(voice.lang));
   if (indianEnglish) {
     return indianEnglish;
   }
 
-  return voices[0] ?? null;
+  return voices.find((voice) => voice.default) ?? voices[0] ?? null;
 }
 
 export function useSpeechSynthesis() {
@@ -51,10 +53,14 @@ export function useSpeechSynthesis() {
       return;
     }
 
-    window.speechSynthesis.cancel();
+    if (speaking) {
+      window.speechSynthesis.cancel();
+    }
 
     const utterance = new SpeechSynthesisUtterance(text.trim());
-    utterance.voice = selectedVoice;
+    if (selectedVoice) {
+      utterance.voice = selectedVoice;
+    }
     utterance.lang = selectedVoice?.lang ?? 'hi-IN';
     utterance.rate = 0.95;
     utterance.pitch = 1;
