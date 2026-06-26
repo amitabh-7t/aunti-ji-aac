@@ -1,133 +1,123 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 interface SpeakOptions {
   onEnd?: () => void;
 }
 
-function pickBestVoice(voices: SpeechSynthesisVoice[]) {
-  // First try to find any Hindi voice
-  const hindi = voices.find((voice) => /hi-IN/i.test(voice.lang));
-  if (hindi) {
-    return hindi;
-  }
+// ─── Module-level refs ────────────────────────────────────────────────────────
+// Prevent Android Chrome from garbage-collecting the utterance object mid-speech
+let _utterance: SpeechSynthesisUtterance | null = null;
 
-  // Fallback to Indian English
-  const indianEnglish = voices.find((voice) => /en-IN/i.test(voice.lang));
-  if (indianEnglish) {
-    return indianEnglish;
-  }
+function getBestVoice(): SpeechSynthesisVoice | null {
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices.length) return null;
 
-  return voices.find((voice) => voice.default) ?? voices[0] ?? null;
+  // Prefer any hi-IN voice
+  const hiIN = voices.find((v) => v.lang === 'hi-IN' || v.lang === 'hi_IN');
+  if (hiIN) return hiIN;
+
+  // Settle for any Hindi
+  const hi = voices.find((v) => v.lang.startsWith('hi'));
+  if (hi) return hi;
+
+  // Indian English
+  const enIN = voices.find((v) => v.lang === 'en-IN');
+  if (enIN) return enIN;
+
+  // Default system voice
+  return voices.find((v) => v.default) ?? voices[0] ?? null;
 }
-
-// Store utterance globally to prevent Android Chrome Garbage Collection bug
-// which stops speech midway and never fires onend
-// Store utterance globally to prevent Android Chrome Garbage Collection bug
-// which stops speech midway and never fires onend
-let globalUtterance: SpeechSynthesisUtterance | null = null;
 
 export function useSpeechSynthesis() {
   const [supported, setSupported] = useState(false);
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [speaking, setSpeaking] = useState(false);
+  const [voicesLoaded, setVoicesLoaded] = useState(false);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // ── Detect support ──────────────────────────────────────────────────────────
   useEffect(() => {
-    setSupported(typeof window !== 'undefined' && 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window);
+    if (typeof window === 'undefined') return;
+    const ok = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
+    setSupported(ok);
   }, []);
 
+  // ── Load voices (with polling for Android Chrome) ───────────────────────────
   useEffect(() => {
-    if (!supported) {
-      return;
-    }
+    if (!supported) return;
 
-    let attempts = 0;
-    const updateVoices = () => {
-      const v = window.speechSynthesis.getVoices();
-      if (v.length > 0) {
-        setVoices(v);
-      } else if (attempts < 10) {
-        attempts++;
-        setTimeout(updateVoices, 250);
+    const tryLoad = () => {
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length > 0) {
+        setVoicesLoaded(true);
+        return;
       }
+      pollTimerRef.current = setTimeout(tryLoad, 300);
     };
 
-    updateVoices();
+    // onvoiceschanged fires reliably on desktop; polling is the fallback for Android
     window.speechSynthesis.onvoiceschanged = () => {
-      setVoices(window.speechSynthesis.getVoices());
+      setVoicesLoaded(true);
     };
+
+    tryLoad();
 
     return () => {
       window.speechSynthesis.onvoiceschanged = null;
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     };
   }, [supported]);
 
-  const selectedVoice = useMemo(() => pickBestVoice(voices), [voices]);
-
-  const speak = (text: string, options: SpeakOptions = {}) => {
-    if (!supported || !text.trim()) {
-      options.onEnd?.();
-      return;
-    }
-
-    if (speaking) {
-      window.speechSynthesis.cancel();
-    }
-
-    const utterance = new SpeechSynthesisUtterance(text.trim());
-    globalUtterance = utterance; // Prevent GC on Android Chrome
-
-    if (selectedVoice) {
-      utterance.voice = selectedVoice;
-    }
-    // Android Chrome sometimes only recognizes "hi" instead of "hi-IN"
-    utterance.lang = selectedVoice?.lang ?? 'hi'; 
-    
-    // Simplest settings possible to avoid Android engine crash
-    utterance.volume = 1;
-    
-    utterance.onstart = () => setSpeaking(true);
-    utterance.onerror = (e) => {
-      console.error('SpeechSynthesisError:', e);
-      // Alert the user so they can debug the issue on their phone
-      if (e.error !== 'interrupted' && e.error !== 'canceled') {
-        alert('Voice Error: ' + e.error);
+  // ── speak ───────────────────────────────────────────────────────────────────
+  // IMPORTANT: This function MUST be called directly from a user-gesture handler
+  // (onClick, onTouchEnd etc.) — NOT inside a setTimeout or Promise.then.
+  // Android Chrome blocks TTS that isn't directly tied to a gesture.
+  const speak = useCallback(
+    (text: string, options: SpeakOptions = {}) => {
+      if (!supported || !text.trim()) {
+        options.onEnd?.();
+        return;
       }
-      setSpeaking(false);
-      options.onEnd?.();
-    };
-    utterance.onend = () => {
-      setSpeaking(false);
-      options.onEnd?.();
-    };
 
-    setSpeaking(true);
-    
-    // Resume hack for Android Chrome stuck states
-    window.speechSynthesis.resume();
-    window.speechSynthesis.speak(utterance);
-    // Another resume right after speak to force it on some broken Samsung browsers
-    setTimeout(() => {
-      window.speechSynthesis.resume();
-    }, 100);
-  };
+      const synth = window.speechSynthesis;
+      // Cancel any ongoing speech first
+      synth.cancel();
 
-  const cancel = () => {
-    if (!supported) {
-      return;
-    }
+      const utterance = new SpeechSynthesisUtterance(text.trim());
+      _utterance = utterance; // Keep alive – prevents Android GC bug
 
+      const voice = getBestVoice();
+      if (voice) utterance.voice = voice;
+      utterance.lang = voice?.lang ?? 'hi-IN';
+      utterance.volume = 1;
+      // Don't set rate/pitch on older Android engines – causes silent failures
+
+      utterance.onstart = () => setSpeaking(true);
+      utterance.onend = () => { setSpeaking(false); options.onEnd?.(); };
+      utterance.onerror = (e) => {
+        // "interrupted" and "canceled" are expected; only log real errors
+        if (e.error !== 'interrupted' && e.error !== 'canceled') {
+          console.error('[TTS error]', e.error);
+        }
+        setSpeaking(false);
+        options.onEnd?.();
+      };
+
+      // The resume() before speak() wakes up Android Chrome's speech engine
+      // when it has been paused by a page-visibility or audio-focus event
+      synth.resume();
+      synth.speak(utterance);
+    },
+    [supported]
+  );
+
+  const cancel = useCallback(() => {
+    if (!supported) return;
     window.speechSynthesis.cancel();
     window.speechSynthesis.resume();
     setSpeaking(false);
-  };
+  }, [supported]);
 
-  return {
-    supported,
-    speaking,
-    selectedVoice,
-    speak,
-    cancel,
-  };
+  return { supported, speaking, voicesLoaded, speak, cancel };
 }

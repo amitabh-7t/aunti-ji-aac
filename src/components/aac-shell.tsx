@@ -1,352 +1,343 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useConversation } from '@/context/conversation-context';
 import { useSpeechRecognition } from '@/hooks/use-speech-recognition';
 import { useSpeechSynthesis } from '@/hooks/use-speech-synthesis';
 
-function statusLabel(listening: boolean, speaking: boolean, thinking: boolean) {
-  if (speaking) {
-    return 'आवाज़ आ रही है...';
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+async function fetchSuggestions(
+  history: ReturnType<typeof useConversation>['turns'],
+  latestInput: string
+): Promise<string[]> {
+  try {
+    const response = await fetch('/api/suggest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ history, latestInput }),
+    });
+    const payload = (await response.json()) as { suggestions?: string[] };
+    return Array.isArray(payload.suggestions) ? payload.suggestions.slice(0, 4) : [];
+  } catch {
+    return [];
   }
-
-  if (thinking) {
-    return 'सोच रहे हैं...';
-  }
-
-  if (listening) {
-    return 'सुन रहे हैं...';
-  }
-
-  return 'रुका हुआ';
 }
 
-async function fetchSuggestions(history: ReturnType<typeof useConversation>['turns'], latestInput: string) {
-  const response = await fetch('/api/suggest', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ history, latestInput }),
-  });
+const DEFAULT_SUGGESTIONS = ['हाँ बेटा', 'ठीक है', 'अभी नहीं', 'मुझे चाहिए'];
 
-  const payload = (await response.json()) as { suggestions?: string[] };
-  return Array.isArray(payload.suggestions) ? payload.suggestions.slice(0, 4) : [];
-}
-
+// ─── Component ────────────────────────────────────────────────────────────────
 export function AacShell() {
   const { turns, addTurn, deleteTurn, clearTurns } = useConversation();
-  const [suggestions, setSuggestions] = useState<string[]>(['हाँ बेटा', 'ठीक है', 'अभी नहीं', 'मुझे चाहिए']);
+
+  const [suggestions, setSuggestions] = useState<string[]>(DEFAULT_SUGGESTIONS);
   const [thinking, setThinking] = useState(false);
-  const [activeInput, setActiveInput] = useState('');
-  const [micStarted, setMicStarted] = useState(false);
   const [customText, setCustomText] = useState('');
-  const latestUtteranceIdRef = useRef<number | null>(null);
-  const debounceTimerRef = useRef<number | null>(null);
 
-  const { supported: recognitionSupported, listening, interimTranscript, latestFinalUtterance, error, start, stop, resetLatestUtterance } =
-    useSpeechRecognition({ language: 'en-IN', autoRestart: true });
-  const { supported: speechSupported, speaking, speak, cancel } = useSpeechSynthesis();
+  // Speech Recognition
+  const {
+    supported: micSupported,
+    listening,
+    interimTranscript,
+    latestFinalUtterance,
+    error: micError,
+    start: startMic,
+    stop: stopMic,
+    resetLatestUtterance,
+  } = useSpeechRecognition({ language: 'hi-IN', autoRestart: true });
 
-  const status = useMemo(() => statusLabel(listening, speaking, thinking), [listening, speaking, thinking]);
+  // Speech Synthesis
+  const { supported: ttsSupported, speaking, speak, cancel } = useSpeechSynthesis();
 
-  const speakWithSilence = (text: string) => {
-    const wasListening = listening;
-    if (wasListening) {
-      stop();
-    }
-    speak(text, {
-      onEnd: () => {
-        if (wasListening) {
-          setTimeout(() => {
-            start();
-          }, 400);
-        }
-      },
-    });
-  };
+  // De-dup tracking
+  const lastUtteranceIdRef = useRef<number | null>(null);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // ── When speech recognition returns a final result → call LLM ──────────────
   useEffect(() => {
-    if (!latestFinalUtterance) {
-      return;
-    }
+    if (!latestFinalUtterance) return;
+    if (latestFinalUtterance.id === lastUtteranceIdRef.current) return;
 
-    if (latestUtteranceIdRef.current === latestFinalUtterance.id) {
-      return;
-    }
+    lastUtteranceIdRef.current = latestFinalUtterance.id;
 
-    latestUtteranceIdRef.current = latestFinalUtterance.id;
-    setActiveInput(latestFinalUtterance.text);
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
 
-    if (debounceTimerRef.current !== null) {
-      window.clearTimeout(debounceTimerRef.current);
-    }
+    debounceTimerRef.current = setTimeout(async () => {
+      const spokenText = latestFinalUtterance.text;
 
-    debounceTimerRef.current = window.setTimeout(async () => {
-      const nextHistory = [
+      const historySnapshot = [
         ...turns,
-        {
-          id: crypto.randomUUID(),
-          role: 'partner' as const,
-          text: latestFinalUtterance.text,
-          createdAt: Date.now(),
-          source: 'speech' as const,
-        },
+        { id: crypto.randomUUID(), role: 'partner' as const, text: spokenText, createdAt: Date.now(), source: 'speech' as const },
       ].slice(-10);
 
-      addTurn({ role: 'partner', text: latestFinalUtterance.text, source: 'speech' });
+      addTurn({ role: 'partner', text: spokenText, source: 'speech' });
       setThinking(true);
 
       try {
-        const nextSuggestions = await fetchSuggestions(nextHistory, latestFinalUtterance.text);
-        if (nextSuggestions.length) {
-          setSuggestions(nextSuggestions);
-        }
+        const next = await fetchSuggestions(historySnapshot, spokenText);
+        if (next.length) setSuggestions(next);
       } finally {
         setThinking(false);
         resetLatestUtterance();
       }
-    }, 650);
-  }, [addTurn, latestFinalUtterance, resetLatestUtterance, turns]);
+    }, 600);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [latestFinalUtterance]);
 
   useEffect(() => {
-    return () => {
-      if (debounceTimerRef.current !== null) {
-        window.clearTimeout(debounceTimerRef.current);
-      }
-    };
+    return () => { if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current); };
   }, []);
 
-  const handlePrimaryAction = () => {
-    if (listening) {
-      stop();
-      setMicStarted(false);
-      cancel();
-      return;
-    }
-
-    start();
-    setMicStarted(true);
-  };
-
-  const handleSuggestionTap = (suggestion: string) => {
-    addTurn({ role: 'user', text: suggestion, source: 'tap' });
-    speakWithSilence(suggestion);
+  // ─── Handlers ───────────────────────────────────────────────────────────────
+  // CRITICAL: speak() MUST be called synchronously inside onClick, never inside
+  // a setTimeout/Promise. Android Chrome blocks TTS not triggered by a gesture.
+  const handleSuggestionTap = (text: string) => {
+    addTurn({ role: 'user', text, source: 'tap' });
+    // Stop mic → speak immediately (synchronous gesture chain)
+    if (listening) stopMic();
+    if (speaking) cancel();
+    speak(text, {
+      onEnd: () => { if (listening) startMic(); },
+    });
   };
 
   const handleCustomSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const text = customText.trim();
     if (!text) return;
-
     addTurn({ role: 'user', text, source: 'tap' });
-    speakWithSilence(text);
+    if (listening) stopMic();
+    if (speaking) cancel();
+    speak(text, {
+      onEnd: () => { if (listening) startMic(); },
+    });
     setCustomText('');
   };
 
-  const handleQuickWordAppend = (word: string) => {
-    setCustomText((prev) => {
-      const trimmed = prev.trim();
-      return trimmed ? `${trimmed} ${word}` : word;
-    });
+  const handleMicToggle = () => {
+    if (listening) {
+      stopMic();
+    } else {
+      startMic();
+    }
   };
 
   const handleClear = () => {
     clearTurns();
-    setSuggestions(['हाँ बेटा', 'ठीक है', 'अभी नहीं', 'मुझे चाहिए']);
-    setActiveInput('');
+    setSuggestions(DEFAULT_SUGGESTIONS);
     cancel();
   };
 
+  // ─── UI ──────────────────────────────────────────────────────────────────────
   return (
-    <main className="aac-shell min-h-screen px-3 py-3 text-ink-50 sm:px-6 sm:py-6 lg:px-8">
-      <section className="mx-auto flex min-h-[calc(100vh-1.5rem)] w-full max-w-4xl flex-col gap-4 rounded-3xl border border-white/10 bg-[color:var(--panel)] p-3 shadow-[0_30px_90px_rgba(0,0,0,0.35)] backdrop-blur-xl sm:p-6">
-        
-        {/* Simple Header */}
-        <header className="flex flex-col gap-3 rounded-2xl border border-white/10 bg-[color:var(--panel-strong)] p-3 shadow-glow sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h1 className="font-[var(--font-accent)] text-2xl font-bold text-white sm:text-3xl">आँटी जी</h1>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <StatusChip label={status} active={listening || speaking || thinking} />
-            <StatusChip label={recognitionSupported ? 'माइक चालू है' : 'माइक सपोर्ट नहीं है'} active={recognitionSupported} />
-            <StatusChip label={speechSupported ? 'आवाज़ तैयार है' : 'आवाज़ सपोर्ट नहीं है'} active={speechSupported} />
-          </div>
-        </header>
+    <main style={{ background: '#f0f4f8', minHeight: '100dvh', fontFamily: "'Noto Sans Devanagari', system-ui, sans-serif" }}>
+      <div style={{ maxWidth: 480, margin: '0 auto', padding: '0 0 40px 0', minHeight: '100dvh', display: 'flex', flexDirection: 'column', background: '#fff' }}>
 
-        {/* Stack Layout - Mobile Friendly & Direct Purpose */}
-        <section className="flex flex-col gap-4">
-          
-          {/* 1. Quick Replies (Most Used Option on Top) */}
-          <div className="rounded-2xl border border-white/10 bg-black/20 p-4 shadow-bubble">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <div>
-                <p className="text-xs uppercase tracking-[0.35em] text-ink-200/70">त्वरित जवाब</p>
-                <h2 className="mt-0.5 text-xl font-semibold text-white">एक बटन दबाएं</h2>
-              </div>
-              <button
-                type="button"
-                onClick={handleClear}
-                className="rounded-full border border-white/10 bg-white/6 px-4 py-2 text-xs font-semibold text-ink-100 transition hover:bg-white/10 active:scale-95"
-              >
-                साफ़ करें
-              </button>
+        {/* ── Top Bar ── */}
+        <div style={{ background: '#fff', borderBottom: '1px solid #e0e8f0', padding: '14px 16px 12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0, zIndex: 20 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ width: 36, height: 36, borderRadius: '50%', background: 'linear-gradient(135deg,#2979ff,#5c6bc0)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <svg width="18" height="18" fill="white" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3zm7 10a7 7 0 0 1-14 0H3a9 9 0 0 0 7.5 8.94V22h3v-1.06A9 9 0 0 0 21 12h-2z"/></svg>
             </div>
+            <span style={{ fontWeight: 700, fontSize: 18, color: '#0d1b2a' }}>बोलें</span>
+            {thinking && <span style={{ fontSize: 12, color: '#2979ff', background: '#e8f0fe', borderRadius: 20, padding: '2px 10px' }}>सोच रहे हैं...</span>}
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            {speaking && <span style={{ fontSize: 12, color: '#2ec05f', background: '#e8f8ef', borderRadius: 20, padding: '2px 10px', fontWeight: 600 }}>🔊 बोल रहे हैं</span>}
+            <button
+              onClick={handleClear}
+              style={{ fontSize: 12, color: '#6b8299', background: '#f0f4f8', border: 'none', borderRadius: 20, padding: '4px 14px', cursor: 'pointer' }}
+            >
+              साफ़
+            </button>
+          </div>
+        </div>
 
-            <div className="grid gap-3 grid-cols-1 sm:grid-cols-2">
-              {suggestions.map((suggestion, index) => (
+        {/* ── Mic / Listening Area ── */}
+        <div style={{ background: listening ? '#e8f0fe' : '#f8fafc', borderBottom: '1px solid #e0e8f0', padding: '20px 16px', textAlign: 'center', transition: 'background 0.3s' }}>
+          {listening && (
+            <div style={{ marginBottom: 12 }}>
+              <p style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.12em', color: '#2979ff', margin: '0 0 8px' }}>सुन रहे हैं...</p>
+              {/* Wave bars */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, height: 32 }}>
+                {[0.4, 0.7, 1, 0.8, 0.5, 0.9, 0.6, 1, 0.7, 0.4].map((delay, i) => (
+                  <div key={i} className="wave-bar" style={{ width: 4, height: 28, borderRadius: 2, background: '#2979ff', animationDelay: `${i * 0.1}s` }} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* What was heard */}
+          {(interimTranscript || latestFinalUtterance?.text) && (
+            <div style={{ background: '#fff', border: '2px solid #2979ff', borderRadius: 16, padding: '12px 16px', marginBottom: 12, textAlign: 'left' }}>
+              <p style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.12em', color: '#2979ff', margin: '0 0 4px' }}>परिवार ने कहा:</p>
+              <p style={{ fontSize: 20, fontWeight: 700, color: '#0d1b2a', margin: 0, lineHeight: 1.3 }}>
+                {interimTranscript || latestFinalUtterance?.text}
+              </p>
+            </div>
+          )}
+
+          {/* Mic Button */}
+          <button
+            onClick={handleMicToggle}
+            disabled={!micSupported}
+            style={{
+              width: 70, height: 70, borderRadius: '50%', border: 'none', cursor: 'pointer',
+              background: listening ? '#2979ff' : '#e8f0fe',
+              color: listening ? '#fff' : '#2979ff',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              margin: '0 auto', boxShadow: listening ? '0 0 0 0 rgba(41,121,255,0.5)' : 'none',
+              transition: 'all 0.3s',
+              position: 'relative',
+            }}
+          >
+            {listening && <div className="pulse-ring" style={{ position: 'absolute', width: 70, height: 70, borderRadius: '50%', border: '4px solid #2979ff' }} />}
+            <svg width="28" height="28" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3zm7 10a7 7 0 0 1-14 0H3a9 9 0 0 0 7.5 8.94V22h3v-1.06A9 9 0 0 0 21 12h-2z"/>
+            </svg>
+          </button>
+          <p style={{ margin: '8px 0 0', fontSize: 12, color: '#6b8299' }}>
+            {!micSupported ? 'माइक सपोर्ट नहीं' : listening ? 'दबाएं बंद करने के लिए' : 'सुनना शुरू करें'}
+          </p>
+          {micError && <p style={{ margin: '6px 0 0', fontSize: 11, color: '#e53935' }}>{micError}</p>}
+        </div>
+
+        {/* ── Quick Reply Buttons ── */}
+        <div style={{ padding: '16px 16px 8px' }}>
+          <p style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.12em', color: '#6b8299', margin: '0 0 12px' }}>
+            {thinking ? '⏳ नए जवाब आ रहे हैं...' : 'त्वरित जवाब — एक दबाएं:'}
+          </p>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            {suggestions.map((text, i) => {
+              const colors = [
+                { bg: '#2ec05f', shadow: 'rgba(46,192,95,0.35)' },
+                { bg: '#2979ff', shadow: 'rgba(41,121,255,0.35)' },
+                { bg: '#ff7c1f', shadow: 'rgba(255,124,31,0.35)' },
+                { bg: '#e53935', shadow: 'rgba(229,57,53,0.35)' },
+              ];
+              const c = colors[i % 4];
+              return (
                 <button
-                  key={`${suggestion}-${index}`}
-                  type="button"
-                  onClick={() => handleSuggestionTap(suggestion)}
-                  className="group min-h-[5.5rem] rounded-2xl border border-white/12 bg-[linear-gradient(145deg,rgba(255,255,255,0.12),rgba(255,255,255,0.04))] px-4 py-4 text-left shadow-bubble transition hover:border-white/25 active:scale-[0.98]"
+                  key={`${text}-${i}`}
+                  onClick={() => handleSuggestionTap(text)}
+                  style={{
+                    background: c.bg,
+                    border: 'none',
+                    borderRadius: 20,
+                    padding: '18px 14px',
+                    color: '#fff',
+                    fontWeight: 700,
+                    fontSize: 20,
+                    lineHeight: 1.25,
+                    textAlign: 'center',
+                    cursor: 'pointer',
+                    boxShadow: `0 6px 20px ${c.shadow}`,
+                    transition: 'transform 0.12s, box-shadow 0.12s',
+                    minHeight: 100,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    wordBreak: 'break-word',
+                  }}
+                  onPointerDown={e => (e.currentTarget.style.transform = 'scale(0.96)')}
+                  onPointerUp={e => (e.currentTarget.style.transform = 'scale(1)')}
+                  onPointerLeave={e => (e.currentTarget.style.transform = 'scale(1)')}
                 >
-                  <span className="block text-[10px] uppercase tracking-[0.32em] text-ink-200/60">विकल्प {index + 1}</span>
-                  <span className="mt-2 block text-2xl font-extrabold leading-tight text-white sm:text-3xl">
-                    {suggestion}
-                  </span>
+                  {text}
                 </button>
-              ))}
-            </div>
+              );
+            })}
           </div>
+        </div>
 
-          {/* 2. Custom Reply Section */}
-          <div className="rounded-2xl border border-white/10 bg-black/25 p-4 shadow-bubble">
-            <div className="mb-3">
-              <p className="text-xs uppercase tracking-[0.35em] text-ink-200/70">अपना जवाब लिखें</p>
-              <h2 className="mt-0.5 text-xl font-semibold text-white">लिखें या शब्द चुनें</h2>
-            </div>
-
-            <form onSubmit={handleCustomSubmit} className="space-y-3">
-              <textarea
-                value={customText}
-                onChange={(e) => setCustomText(e.target.value)}
-                placeholder="यहाँ अपना जवाब लिखें..."
-                className="w-full min-h-[4.5rem] rounded-xl border border-white/10 bg-white/5 p-3 text-lg text-white placeholder-white/30 focus:border-apricot/40 focus:outline-none transition resize-none"
-                rows={2}
-              />
-
-              <div className="flex flex-col gap-3">
-                {/* Quick Phrase Helpers */}
-                <div className="flex flex-wrap gap-1.5">
-                  {['हाँ', 'नहीं', 'पानी', 'चाय', 'दर्द', 'टॉयलेट', 'ठीक है', 'सोना है'].map((word) => (
-                    <button
-                      key={word}
-                      type="button"
-                      onClick={() => handleQuickWordAppend(word)}
-                      className="rounded-full border border-white/8 bg-white/6 px-3.5 py-2 text-sm text-white hover:bg-white/12 active:scale-95 transition"
-                    >
-                      {word}
-                    </button>
-                  ))}
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={!customText.trim()}
-                  className="w-full min-h-14 rounded-xl bg-gradient-to-r from-apricot to-coral text-base font-bold text-ink-900 shadow-glow transition active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  बोलें और सेव करें
-                </button>
-              </div>
-            </form>
-          </div>
-
-          {/* 3. Mic Control Section */}
-          <div className="rounded-2xl border border-white/10 bg-black/25 p-4 shadow-bubble">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <p className="text-xs uppercase tracking-[0.35em] text-ink-200/70">आवाज़ सुनना</p>
-                <h2 className="mt-0.5 text-xl font-semibold text-white">
-                  {micStarted ? 'परिवार की आवाज़ सुन रहे हैं' : 'माइक चालू करने के लिए दबाएं'}
-                </h2>
-              </div>
+        {/* ── Custom Text Input ── */}
+        <div style={{ padding: '12px 16px' }}>
+          <p style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.12em', color: '#6b8299', margin: '0 0 8px' }}>खुद लिखें:</p>
+          {/* Quick word chips */}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+            {['हाँ', 'नहीं', 'पानी', 'चाय', 'दर्द', 'टॉयलेट', 'ठीक है', 'सोना है', 'भूख', 'दवाई'].map((w) => (
               <button
-                type="button"
-                onClick={handlePrimaryAction}
-                className="min-h-14 sm:min-h-16 rounded-xl border border-white/10 bg-gradient-to-r from-apricot via-coral to-sky px-6 text-base font-bold text-ink-900 shadow-glow transition active:scale-[0.98]"
+                key={w}
+                onClick={() => setCustomText((prev) => (prev.trim() ? `${prev.trim()} ${w}` : w))}
+                style={{ background: '#e8f0fe', border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 14, color: '#2979ff', fontWeight: 600, cursor: 'pointer' }}
               >
-                {listening ? 'सुनना बंद करें' : 'सुनना शुरू करें'}
+                {w}
               </button>
-            </div>
-
-            <div className="mt-3 grid gap-3 grid-cols-1 sm:grid-cols-2">
-              <StatCard label="आखिरी बार सुना" value={activeInput || 'आवाज़ का इंतज़ार है...'} />
-              <StatCard label="लाइव शब्द" value={interimTranscript || 'कुछ सुनाई नहीं दिया...'} />
-            </div>
-
-            {error ? (
-              <p className="mt-3 rounded-xl border border-red-400/30 bg-red-500/10 px-4 py-2.5 text-sm text-red-100">{error}</p>
-            ) : null}
+            ))}
           </div>
+          <form onSubmit={handleCustomSubmit} style={{ display: 'flex', gap: 8 }}>
+            <input
+              value={customText}
+              onChange={(e) => setCustomText(e.target.value)}
+              placeholder="यहाँ लिखें..."
+              style={{ flex: 1, border: '2px solid #e0e8f0', borderRadius: 14, padding: '12px 14px', fontSize: 16, color: '#0d1b2a', background: '#fff', outline: 'none' }}
+              onFocus={e => (e.currentTarget.style.borderColor = '#2979ff')}
+              onBlur={e => (e.currentTarget.style.borderColor = '#e0e8f0')}
+            />
+            <button
+              type="submit"
+              disabled={!customText.trim()}
+              style={{ background: '#2979ff', border: 'none', borderRadius: 14, padding: '12px 18px', color: '#fff', fontWeight: 700, fontSize: 16, cursor: 'pointer', opacity: customText.trim() ? 1 : 0.4 }}
+            >
+              🔊
+            </button>
+          </form>
+        </div>
 
-          {/* 4. Conversation History */}
-          <div className="rounded-2xl border border-white/10 bg-black/25 p-4 shadow-bubble">
-            <p className="text-xs uppercase tracking-[0.35em] text-ink-200/70">बातचीत का इतिहास</p>
-            <div className="mt-3 flex max-h-[14rem] flex-col gap-2.5 overflow-auto pr-1">
-              {turns.length === 0 ? (
-                <div className="rounded-xl border border-dashed border-white/12 px-4 py-5 text-sm text-ink-200/70">
-                  अभी कोई बातचीत शुरू नहीं हुई है।
-                </div>
-              ) : (
-                turns.map((turn) => (
+        {/* ── Conversation History ── */}
+        {turns.length > 0 && (
+          <div style={{ padding: '4px 16px 16px' }}>
+            <p style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.12em', color: '#6b8299', margin: '0 0 10px' }}>हाल की बातचीत:</p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {turns.slice(-8).map((turn) => {
+                const isUser = turn.role === 'user';
+                return (
                   <div
                     key={turn.id}
-                    className={`relative group rounded-xl border px-3.5 py-2.5 text-sm leading-relaxed transition ${
-                      turn.role === 'partner'
-                        ? 'border-sky-300/20 bg-sky-400/10 text-sky-50'
-                        : 'border-mint-300/20 bg-mint-400/10 text-mint-50'
-                    }`}
+                    style={{
+                      display: 'flex', alignItems: 'flex-start', gap: 8,
+                      flexDirection: isUser ? 'row-reverse' : 'row',
+                    }}
                   >
-                    <div className="flex justify-between items-start gap-3">
-                      <div className="flex-1">
-                        <div className="mb-0.5 text-[10px] uppercase tracking-[0.2em] text-white/55">
-                          {turn.role === 'partner' ? 'परिवार' : 'आँटी जी'} · {turn.source === 'speech' ? 'बोला' : 'दबाया'}
-                        </div>
-                        <p className="break-words">{turn.text}</p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => deleteTurn(turn.id)}
-                        className="text-white/40 hover:text-red-400 p-1 -mr-1 -mt-1 rounded-full hover:bg-white/10 active:scale-95 transition"
-                        title="हटाएं"
-                        aria-label="हटाएं"
-                      >
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                      </button>
+                    <div style={{
+                      width: 32, height: 32, borderRadius: '50%', flexShrink: 0,
+                      background: isUser ? '#2ec05f' : '#2979ff',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    }}>
+                      {isUser
+                        ? <svg width="16" height="16" fill="white" viewBox="0 0 24 24"><path d="M3 18.5C3 15.46 7.03 13 12 13s9 2.46 9 5.5V20H3v-1.5zM12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"/></svg>
+                        : <svg width="16" height="16" fill="white" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3zm7 10a7 7 0 0 1-14 0H3a9 9 0 0 0 7.5 8.94V22h3v-1.06A9 9 0 0 0 21 12h-2z"/></svg>
+                      }
                     </div>
+                    <div style={{
+                      background: isUser ? '#e8f8ef' : '#e8f0fe',
+                      borderRadius: isUser ? '18px 4px 18px 18px' : '4px 18px 18px 18px',
+                      padding: '8px 12px', flex: 1, maxWidth: '78%',
+                    }}>
+                      <p style={{ margin: 0, fontSize: 15, color: '#0d1b2a', fontWeight: 500 }}>{turn.text}</p>
+                      <p style={{ margin: '2px 0 0', fontSize: 10, color: '#6b8299' }}>
+                        {isUser ? '🔊 आपने कहा' : '👂 परिवार ने कहा'}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => deleteTurn(turn.id)}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ccc', fontSize: 14, padding: 4, flexShrink: 0 }}
+                    >
+                      ×
+                    </button>
                   </div>
-                ))
-              )}
+                );
+              })}
             </div>
           </div>
+        )}
 
-        </section>
-      </section>
+        {/* ── TTS not supported warning ── */}
+        {!ttsSupported && (
+          <div style={{ margin: '12px 16px', background: '#fde8e8', border: '1px solid #e53935', borderRadius: 12, padding: '10px 14px' }}>
+            <p style={{ margin: 0, fontSize: 13, color: '#c62828' }}>⚠️ इस ब्राउज़र में आवाज़ सपोर्ट नहीं है। कृपया Chrome या Samsung Internet में खोलें।</p>
+          </div>
+        )}
+      </div>
     </main>
-  );
-}
-
-function StatusChip({ label, active }: { label: string; active: boolean }) {
-  return (
-    <span
-      className={`inline-flex items-center rounded-full border px-3 py-1.5 text-xs font-semibold ${
-        active
-          ? 'border-white/15 bg-white/10 text-white'
-          : 'border-white/10 bg-black/20 text-ink-200/70'
-      }`}
-    >
-      <span className={`mr-1.5 inline-block h-2 w-2 rounded-full ${active ? 'bg-apricot' : 'bg-white/25'}`} />
-      {label}
-    </span>
-  );
-}
-
-function StatCard({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-xl border border-white/10 bg-white/6 p-3">
-      <p className="text-[10px] uppercase tracking-[0.25em] text-ink-200/65">{label}</p>
-      <p className="mt-2 line-clamp-2 min-h-[3rem] text-base font-semibold text-white">{value}</p>
-    </div>
   );
 }
