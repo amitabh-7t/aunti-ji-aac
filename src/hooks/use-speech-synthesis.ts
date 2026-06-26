@@ -22,6 +22,10 @@ function pickBestVoice(voices: SpeechSynthesisVoice[]) {
   return voices.find((voice) => voice.default) ?? voices[0] ?? null;
 }
 
+// Store utterance globally to prevent Android Chrome Garbage Collection bug
+// which stops speech midway and never fires onend
+let globalUtterance: SpeechSynthesisUtterance | null = null;
+
 export function useSpeechSynthesis() {
   const [supported, setSupported] = useState(false);
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
@@ -58,6 +62,8 @@ export function useSpeechSynthesis() {
     }
 
     const utterance = new SpeechSynthesisUtterance(text.trim());
+    globalUtterance = utterance; // Prevent GC on Android Chrome
+
     if (selectedVoice) {
       utterance.voice = selectedVoice;
     }
@@ -76,7 +82,14 @@ export function useSpeechSynthesis() {
     };
 
     setSpeaking(true);
+    
+    // Resume hack for Android Chrome stuck states
+    window.speechSynthesis.resume();
     window.speechSynthesis.speak(utterance);
+    // Another resume right after speak to force it on some broken Samsung browsers
+    setTimeout(() => {
+      window.speechSynthesis.resume();
+    }, 50);
   };
 
   const cancel = () => {
@@ -85,6 +98,7 @@ export function useSpeechSynthesis() {
     }
 
     window.speechSynthesis.cancel();
+    window.speechSynthesis.resume();
     setSpeaking(false);
   };
 
