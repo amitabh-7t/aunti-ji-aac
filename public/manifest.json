@@ -1,0 +1,18 @@
+{
+  "name": "Aunti Ji AAC",
+  "short_name": "AAC",
+  "description": "A full-screen AAC assistant with speech-to-text, LLM suggestions, and speech output.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#11100c",
+  "theme_color": "#11100c",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
