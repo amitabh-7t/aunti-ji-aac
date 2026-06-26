@@ -23,7 +23,25 @@ async function fetchSuggestions(
   }
 }
 
+async function fetchWordSuggestions(
+  partialSentence: string,
+  history: ReturnType<typeof useConversation>['turns']
+): Promise<string[]> {
+  try {
+    const response = await fetch('/api/word-suggest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ partialSentence, history }),
+    });
+    const payload = (await response.json()) as { words?: string[] };
+    return Array.isArray(payload.words) ? payload.words.slice(0, 6) : [];
+  } catch {
+    return [];
+  }
+}
+
 const DEFAULT_SUGGESTIONS = ['हाँ बेटा', 'ठीक है', 'अभी नहीं', 'मुझे चाहिए'];
+const DEFAULT_WORD_SUGGESTIONS = ['हाँ', 'नहीं', 'मुझे', 'ठीक', 'अभी'];
 
 // ─── Component ────────────────────────────────────────────────────────────────
 export function AacShell() {
@@ -32,6 +50,13 @@ export function AacShell() {
   const [suggestions, setSuggestions] = useState<string[]>(DEFAULT_SUGGESTIONS);
   const [thinking, setThinking] = useState(false);
   const [customText, setCustomText] = useState('');
+
+  // Word Builder state
+  const [wordBuilderOpen, setWordBuilderOpen] = useState(false);
+  const [builtSentence, setBuiltSentence] = useState('');
+  const [wordSuggestions, setWordSuggestions] = useState<string[]>(DEFAULT_WORD_SUGGESTIONS);
+  const [loadingWords, setLoadingWords] = useState(false);
+  const wordFetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Speech Recognition
   const {
@@ -125,6 +150,54 @@ export function AacShell() {
     clearTurns();
     setSuggestions(DEFAULT_SUGGESTIONS);
     cancel();
+  };
+
+  // ─── Word Builder Handlers ──────────────────────────────────────────────────
+  const refreshWordSuggestions = (sentence: string) => {
+    if (wordFetchTimerRef.current) clearTimeout(wordFetchTimerRef.current);
+    wordFetchTimerRef.current = setTimeout(async () => {
+      setLoadingWords(true);
+      try {
+        const words = await fetchWordSuggestions(sentence, turns);
+        if (words.length) setWordSuggestions(words);
+      } finally {
+        setLoadingWords(false);
+      }
+    }, 350); // debounce so we don't fire on every tap
+  };
+
+  const handleWordTap = (word: string) => {
+    const next = builtSentence ? `${builtSentence} ${word}` : word;
+    setBuiltSentence(next);
+    refreshWordSuggestions(next);
+  };
+
+  const handleWordBackspace = () => {
+    const words = builtSentence.trim().split(' ');
+    words.pop();
+    const next = words.join(' ');
+    setBuiltSentence(next);
+    refreshWordSuggestions(next);
+  };
+
+  const handleWordBuilderSpeak = () => {
+    if (!builtSentence.trim()) return;
+    addTurn({ role: 'user', text: builtSentence.trim(), source: 'tap' });
+    if (listening) stopMic();
+    if (speaking) cancel();
+    speak(builtSentence.trim(), {
+      onEnd: () => { if (listening) startMic(); },
+    });
+    setBuiltSentence('');
+    setWordSuggestions(DEFAULT_WORD_SUGGESTIONS);
+  };
+
+  const handleOpenWordBuilder = () => {
+    setWordBuilderOpen(true);
+    setBuiltSentence('');
+    setWordSuggestions(DEFAULT_WORD_SUGGESTIONS);
+    // Pre-load suggestions based on current conversation
+    refreshWordSuggestions('');
   };
 
   // ─── UI ──────────────────────────────────────────────────────────────────────
@@ -248,6 +321,92 @@ export function AacShell() {
             })}
           </div>
         </div>
+
+        {/* ── Word Builder Section ── */}
+        {!wordBuilderOpen ? (
+          <div style={{ padding: '0 16px 8px' }}>
+            <button
+              onClick={handleOpenWordBuilder}
+              style={{
+                width: '100%', background: 'linear-gradient(135deg,#7c4dff,#2979ff)', border: 'none',
+                borderRadius: 16, padding: '14px 18px', color: '#fff', fontWeight: 700, fontSize: 16,
+                cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+                boxShadow: '0 4px 16px rgba(124,77,255,0.3)',
+              }}
+            >
+              <span style={{ fontSize: 20 }}>✨</span> शब्द जोड़कर वाक्य बनाएं
+            </button>
+          </div>
+        ) : (
+          <div style={{ padding: '12px 16px', borderTop: '2px solid #7c4dff22', borderBottom: '2px solid #7c4dff22', background: '#f8f5ff' }}>
+            {/* Header */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+              <p style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.12em', color: '#7c4dff', margin: 0 }}>✨ शब्द जोड़कर वाक्य बनाएं</p>
+              <button
+                onClick={() => { setWordBuilderOpen(false); setBuiltSentence(''); }}
+                style={{ background: 'none', border: 'none', color: '#9e9e9e', fontSize: 18, cursor: 'pointer', padding: 4 }}
+              >×</button>
+            </div>
+
+            {/* Composed sentence display */}
+            <div style={{
+              minHeight: 64, background: '#fff', border: '2px solid #7c4dff', borderRadius: 14,
+              padding: '12px 14px', marginBottom: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8
+            }}>
+              <p style={{ margin: 0, fontSize: 22, fontWeight: 700, color: builtSentence ? '#0d1b2a' : '#b0b8c4', flex: 1, lineHeight: 1.3 }}>
+                {builtSentence || 'शब्द चुनें...'}
+              </p>
+              {builtSentence && (
+                <button
+                  onClick={handleWordBackspace}
+                  style={{ background: '#f0f4f8', border: 'none', borderRadius: 10, padding: '8px 10px', color: '#e53935', fontWeight: 700, fontSize: 18, cursor: 'pointer', flexShrink: 0 }}
+                >⌫</button>
+              )}
+            </div>
+
+            {/* Word suggestion chips — Gboard style */}
+            <div style={{ marginBottom: 12 }}>
+              <p style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.12em', color: '#9e9e9e', margin: '0 0 8px' }}>
+                {loadingWords ? '⌛ शब्द आ रहे हैं...' : 'अगला शब्द चुनें:'}
+              </p>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {wordSuggestions.map((word, i) => (
+                  <button
+                    key={`${word}-${i}`}
+                    onClick={() => handleWordTap(word)}
+                    style={{
+                      background: '#fff', border: '2px solid #7c4dff', borderRadius: 24,
+                      padding: '10px 18px', fontSize: 18, fontWeight: 700, color: '#7c4dff',
+                      cursor: 'pointer', boxShadow: '0 2px 8px rgba(124,77,255,0.15)',
+                      transition: 'all 0.12s',
+                    }}
+                    onPointerDown={e => { e.currentTarget.style.background = '#7c4dff'; e.currentTarget.style.color = '#fff'; }}
+                    onPointerUp={e => { e.currentTarget.style.background = '#fff'; e.currentTarget.style.color = '#7c4dff'; }}
+                    onPointerLeave={e => { e.currentTarget.style.background = '#fff'; e.currentTarget.style.color = '#7c4dff'; }}
+                  >
+                    {word}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Speak button */}
+            <button
+              onClick={handleWordBuilderSpeak}
+              disabled={!builtSentence.trim()}
+              style={{
+                width: '100%', background: builtSentence.trim() ? '#2ec05f' : '#e0e8f0',
+                border: 'none', borderRadius: 14, padding: '14px 18px',
+                color: builtSentence.trim() ? '#fff' : '#9e9e9e', fontWeight: 700,
+                fontSize: 18, cursor: builtSentence.trim() ? 'pointer' : 'not-allowed',
+                boxShadow: builtSentence.trim() ? '0 4px 16px rgba(46,192,95,0.35)' : 'none',
+                transition: 'all 0.2s',
+              }}
+            >
+              🔊 यह बोलें
+            </button>
+          </div>
+        )}
 
         {/* ── Custom Text Input ── */}
         <div style={{ padding: '12px 16px' }}>
