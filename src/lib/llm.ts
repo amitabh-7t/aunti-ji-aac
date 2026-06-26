@@ -19,11 +19,13 @@ function normalizeSuggestions(values: string[]) {
 export async function createSuggestions(body: SuggestionRequestBody) {
   const latestInput = body.latestInput.trim();
   if (!latestInput) {
+    console.log('[LLM] No latestInput, returning fallback.');
     return createFallbackSuggestions('');
   }
 
   const apiKey = process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY;
   if (!apiKey) {
+    console.error('[LLM] ERROR: No API key found. Set GROQ_API_KEY in Vercel environment variables.');
     return createFallbackSuggestions(latestInput);
   }
 
@@ -33,7 +35,9 @@ export async function createSuggestions(body: SuggestionRequestBody) {
     : 'https://api.openai.com/v1/chat/completions';
   const model =
     process.env.AAC_MODEL ||
-    (usingGroq ? 'llama-3.1-70b-versatile' : 'gpt-4o-mini');
+    (usingGroq ? 'llama-3.3-70b-versatile' : 'gpt-4o-mini');
+
+  console.log(`[LLM] Calling ${usingGroq ? 'Groq' : 'OpenAI'} with model: ${model}, input: "${latestInput}"`);
 
   const { systemPrompt, userPrompt } = buildSuggestionMessages(body.history, latestInput);
 
@@ -46,7 +50,7 @@ export async function createSuggestions(body: SuggestionRequestBody) {
     body: JSON.stringify({
       model,
       temperature: 0.7,
-      max_tokens: 120,
+      max_tokens: 200,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
@@ -55,6 +59,8 @@ export async function createSuggestions(body: SuggestionRequestBody) {
   });
 
   if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    console.error(`[LLM] API error ${response.status}: ${errText}`);
     return createFallbackSuggestions(latestInput);
   }
 
@@ -63,7 +69,10 @@ export async function createSuggestions(body: SuggestionRequestBody) {
   };
 
   const content = payload.choices?.[0]?.message?.content ?? '';
+  console.log('[LLM] Raw response:', content);
+
   const parsed = parseSuggestions(content);
   const normalized = normalizeSuggestions(parsed);
+  console.log('[LLM] Final suggestions:', normalized);
   return normalized.length ? normalized : createFallbackSuggestions(latestInput);
 }
